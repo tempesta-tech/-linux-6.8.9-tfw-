@@ -585,7 +585,7 @@ static __always_inline void setup_cet(struct cpuinfo_x86 *c)
 		set_cpu_cap(c, X86_FEATURE_USER_SHSTK);
 
 	if (kernel_ibt)
-		wrmsrl(MSR_IA32_S_CET, CET_ENDBR_EN);
+		wrmsrl(MSR_IA32_S_CET, CET_ENDBR_EN | CET_NO_TRACK_EN);
 	else
 		wrmsrl(MSR_IA32_S_CET, 0);
 

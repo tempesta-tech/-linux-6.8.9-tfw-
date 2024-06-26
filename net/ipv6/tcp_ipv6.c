@@ -65,6 +65,7 @@
 
 #include <crypto/hash.h>
 #include <linux/scatterlist.h>
+#include <linux/tempesta.h>
 
 #include <trace/events/tcp.h>
 
@@ -563,7 +564,11 @@ static int tcp_v6_send_synack(const struct sock *sk, struct dst_entry *dst,
 
 		rcu_read_lock();
 		opt = ireq->ipv6_opt;
+#ifdef CONFIG_SECURITY_TEMPESTA
+		if (!sock_flag(sk, SOCK_TEMPESTA) && !opt)
+#else
 		if (!opt)
+#endif
 			opt = rcu_dereference(np->opt);
 		err = ip6_xmit(sk, skb, fl6, skb->mark ? : READ_ONCE(sk->sk_mark),
 			       opt, tclass, READ_ONCE(sk->sk_priority));
@@ -1488,7 +1493,11 @@ static struct sock *tcp_v6_syn_recv_sock(const struct sock *sk, struct sk_buff *
 	   to newsk.
 	 */
 	opt = ireq->ipv6_opt;
+#ifdef CONFIG_SECURITY_TEMPESTA
+	if (!sock_flag(sk, SOCK_TEMPESTA) && !opt)
+#else
 	if (!opt)
+#endif
 		opt = rcu_dereference(np->opt);
 	if (opt) {
 		opt = ipv6_dup_options(newsk, opt);
@@ -1532,7 +1541,20 @@ static struct sock *tcp_v6_syn_recv_sock(const struct sock *sk, struct sk_buff *
 	if (tcp_ao_copy_all_matching(sk, newsk, req, skb, AF_INET6))
 		goto out; /* OOM */
 #endif
-
+#ifdef CONFIG_SECURITY_TEMPESTA
+	/*
+	 * We need already initialized socket addresses,
+	 * so there is no appropriate security hook.
+	 */
+	if (tempesta_new_clntsk(newsk, skb)) {
+		tcp_v6_send_reset(newsk, skb);
+		tempesta_close_clntsk(newsk);
+		ireq->aborted = true;
+		inet_csk_prepare_forced_close(newsk);
+		tcp_done(newsk);
+		goto out;
+	}
+#endif
 	if (__inet_inherit_port(sk, newsk) < 0) {
 		inet_csk_prepare_forced_close(newsk);
 		tcp_done(newsk);

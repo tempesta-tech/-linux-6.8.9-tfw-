@@ -29,6 +29,7 @@
 #include <linux/wait_bit.h>
 
 #include <asm/softirq_stack.h>
+#include <asm/fpu/api.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/irq.h>
@@ -61,7 +62,7 @@ static struct softirq_action softirq_vec[NR_SOFTIRQS] __cacheline_aligned_in_smp
 DEFINE_PER_CPU(struct task_struct *, ksoftirqd);
 
 const char * const softirq_to_name[NR_SOFTIRQS] = {
-	"HI", "TIMER", "NET_TX", "NET_RX", "BLOCK", "IRQ_POLL",
+	"HI", "TIMER", "NET_RX", "NET_TX", "BLOCK", "IRQ_POLL",
 	"TASKLET", "SCHED", "HRTIMER", "RCU"
 };
 
@@ -577,6 +578,10 @@ restart:
 		wakeup_softirqd();
 	}
 
+#ifdef CONFIG_SECURITY_TEMPESTA
+	__kernel_fpu_end_bh();
+#endif
+
 	account_softirq_exit(current);
 	lockdep_softirq_end(in_hardirq);
 	softirq_handle_end();
@@ -687,6 +692,7 @@ void raise_softirq(unsigned int nr)
 	raise_softirq_irqoff(nr);
 	local_irq_restore(flags);
 }
+EXPORT_SYMBOL(raise_softirq);
 
 void __raise_softirq_irqoff(unsigned int nr)
 {

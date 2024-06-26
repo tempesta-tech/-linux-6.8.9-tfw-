@@ -513,6 +513,19 @@ struct sock {
 	void			(*sk_state_change)(struct sock *sk);
 	void			(*sk_data_ready)(struct sock *sk);
 	void			(*sk_write_space)(struct sock *sk);
+#ifdef CONFIG_SECURITY_TEMPESTA
+	int			(*sk_prepare_xmit)(struct sock *sk,
+						   struct sk_buff *skb,
+						   unsigned int mss_now,
+						   unsigned int *limit,
+						   unsigned int *skbs);
+	int			(*sk_write_xmit)(struct sock *sk,
+						 struct sk_buff *skb,
+						 unsigned int mss_now,
+						 unsigned int limit,
+						 unsigned int skbs);
+	void			(*sk_destroy_cb)(struct sock *sk);
+#endif
 	void			(*sk_error_report)(struct sock *sk);
 	int			(*sk_backlog_rcv)(struct sock *sk,
 						  struct sk_buff *skb);
@@ -930,6 +943,9 @@ enum sock_flags {
 	SOCK_XDP, /* XDP is attached */
 	SOCK_TSTAMP_NEW, /* Indicates 64 bit timestamps always */
 	SOCK_RCVMARK, /* Receive SO_MARK  ancillary data with packet */
+#ifdef CONFIG_SECURITY_TEMPESTA
+	SOCK_TEMPESTA, /* The socket is managed by Tempesta FW */
+#endif
 };
 
 #define SK_FLAGS_TIMESTAMP ((1UL << SOCK_TIMESTAMP) | (1UL << SOCK_TIMESTAMPING_RX_SOFTWARE))
@@ -1173,6 +1189,16 @@ static inline void sock_rps_reset_rxhash(struct sock *sk)
 		__rc = __dis == __sk->sk_disconnects ? __condition : -EPIPE; \
 		__rc;							\
 	})
+
+/**
+ * sk_stream_closing - Return 1 if we still have things to send in our buffers.
+ * @sk: socket to verify
+ */
+static inline int sk_stream_closing(struct sock *sk)
+{
+	return (1 << sk->sk_state) &
+	       (TCPF_FIN_WAIT1 | TCPF_CLOSING | TCPF_LAST_ACK);
+}
 
 int sk_stream_wait_connect(struct sock *sk, long *timeo_p);
 int sk_stream_wait_memory(struct sock *sk, long *timeo_p);
@@ -2136,8 +2162,7 @@ static inline bool sk_rethink_txhash(struct sock *sk)
 static inline struct dst_entry *
 __sk_dst_get(const struct sock *sk)
 {
-	return rcu_dereference_check(sk->sk_dst_cache,
-				     lockdep_sock_is_held(sk));
+	return rcu_dereference_raw(sk->sk_dst_cache);
 }
 
 static inline struct dst_entry *

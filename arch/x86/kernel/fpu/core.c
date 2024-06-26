@@ -57,6 +57,10 @@ DEFINE_PER_CPU(struct fpu *, fpu_fpregs_owner_ctx);
  */
 bool irq_fpu_usable(void)
 {
+#ifdef CONFIG_SECURITY_TEMPESTA
+	if (likely(in_serving_softirq()))
+		return true;
+#endif
 	if (WARN_ON_ONCE(in_nmi()))
 		return false;
 
@@ -420,7 +424,19 @@ EXPORT_SYMBOL_GPL(fpu_copy_uabi_to_guest_fpstate);
 
 void kernel_fpu_begin_mask(unsigned int kfpu_mask)
 {
+#ifdef CONFIG_SECURITY_TEMPESTA
+	/*
+	 * We don't know in which context the function is called, but we know
+	 * preciseely that softirq uses FPU, so we have to disable softirq as
+	 * well as task preemption.
+	 */
+	if (!in_serving_softirq())
+		local_bh_disable();
+	else if (this_cpu_read(in_kernel_fpu))
+		return;
+#else
 	preempt_disable();
+#endif
 
 	WARN_ON_FPU(!irq_fpu_usable());
 	WARN_ON_FPU(this_cpu_read(in_kernel_fpu));
@@ -443,12 +459,28 @@ void kernel_fpu_begin_mask(unsigned int kfpu_mask)
 }
 EXPORT_SYMBOL_GPL(kernel_fpu_begin_mask);
 
+#ifdef CONFIG_SECURITY_TEMPESTA
+void __kernel_fpu_end_bh(void)
+{
+	this_cpu_write(in_kernel_fpu, false);
+}
+#endif
+
 void kernel_fpu_end(void)
 {
+#ifdef CONFIG_SECURITY_TEMPESTA
+	if (likely(in_serving_softirq()))
+		return;
+#endif
 	WARN_ON_FPU(!this_cpu_read(in_kernel_fpu));
 
 	this_cpu_write(in_kernel_fpu, false);
+
+#ifdef CONFIG_SECURITY_TEMPESTA
+	local_bh_enable();
+#else
 	preempt_enable();
+#endif
 }
 EXPORT_SYMBOL_GPL(kernel_fpu_end);
 

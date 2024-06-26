@@ -27,6 +27,7 @@
 #include <linux/swap.h>
 #include <linux/cma.h>
 #include <linux/crash_dump.h>
+#include <linux/tempesta.h>
 #include "internal.h"
 #include "slab.h"
 #include "shuffle.h"
@@ -2772,6 +2773,15 @@ void __init mm_core_init(void)
 	stack_depot_early_init();
 	mem_init();
 	mem_init_print_info();
+
+#ifdef CONFIG_SECURITY_TEMPESTA
+	/*
+	 * Tempesta: reserve pages just when zones are initialized
+	 * to get continous address space of huge pages.
+	 */
+	tempesta_reserve_pages();
+#endif
+
 	kmem_cache_init();
 	/*
 	 * page_owner must be initialized after buddy is ready, and also after
@@ -2790,6 +2800,12 @@ void __init mm_core_init(void)
 	init_espfix_bsp();
 	/* Should be run after espfix64 is set up. */
 	pti_init();
+
+#ifdef CONFIG_SECURITY_TEMPESTA
+	/* Try vmalloc() if the previous one failed. */
+	tempesta_reserve_vmpages();
+#endif
+
 	kmsan_init_runtime();
 	mm_cache_init();
 }

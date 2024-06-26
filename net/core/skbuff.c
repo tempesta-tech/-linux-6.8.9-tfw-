@@ -89,7 +89,9 @@
 #include "sock_destructor.h"
 
 struct kmem_cache *skbuff_cache __ro_after_init;
+#ifndef CONFIG_SECURITY_TEMPESTA
 static struct kmem_cache *skbuff_fclone_cache __ro_after_init;
+#endif
 #ifdef CONFIG_SKB_EXTENSIONS
 static struct kmem_cache *skbuff_ext_cache __ro_after_init;
 #endif
@@ -540,6 +542,7 @@ struct sk_buff *napi_build_skb(void *data, unsigned int frag_size)
 }
 EXPORT_SYMBOL(napi_build_skb);
 
+#ifndef CONFIG_SECURITY_TEMPESTA
 /*
  * kmalloc_reserve is a wrapper around kmalloc_node_track_caller that tells
  * the caller if emergency pfmemalloc reserves are being used. If it is and
@@ -595,6 +598,219 @@ out:
 
 	return obj;
 }
+#endif
+
+#ifdef CONFIG_SECURITY_TEMPESTA
+static void kmalloc_reserve_size(unsigned int *size, gfp_t flags, int node,
+			     bool *pfmemalloc)
+{
+	bool ret_pfmemalloc = false;
+	size_t obj_size;
+
+	obj_size = SKB_HEAD_ALIGN(*size);
+	if (obj_size <= SKB_SMALL_HEAD_CACHE_SIZE &&
+	    !(flags & KMALLOC_NOT_NORMAL_BITS)) {
+		*size = SKB_SMALL_HEAD_CACHE_SIZE;
+		if (!gfp_pfmemalloc_allowed(flags))
+			goto out;
+		/* Try again but now we are using pfmemalloc reserves */
+		ret_pfmemalloc = true;
+		goto out;
+	}
+
+	obj_size = kmalloc_size_roundup(obj_size);
+	/* The following cast might truncate high-order bits of obj_size, this
+	 * is harmless because kmalloc(obj_size >= 2^32) will fail anyway.
+	 */
+	*size = (unsigned int)obj_size;
+
+	/*
+	 * Try a regular allocation, when that fails and we're not entitled
+	 * to the reserves, fail.
+	 */
+	if (!gfp_pfmemalloc_allowed(flags))
+		goto out;
+
+	/* Try again but now we are using pfmemalloc reserves */
+	ret_pfmemalloc = true;
+
+out:
+	if (pfmemalloc)
+		*pfmemalloc = ret_pfmemalloc;
+}
+#endif
+
+/*
+ * Chunks of size 128B, 256B, 512B, 1KB and 2KB.
+ * Typical sk_buff requires ~272B or ~552B (for fclone),
+ * skb_shared_info is ~320B.
+ */
+#define PG_LISTS_N		5
+#define PG_CHUNK_BITS		(PAGE_SHIFT - 5)
+#define PG_CHUNK_SZ		(1 << PG_CHUNK_BITS)
+#define PG_CHUNK_MASK		(~(PG_CHUNK_SZ - 1))
+#define PG_ALLOC_SZ(s)		(((s) + (PG_CHUNK_SZ - 1)) & PG_CHUNK_MASK)
+#define PG_CHUNK_NUM(s)		(PG_ALLOC_SZ(s) >> PG_CHUNK_BITS)
+#define PG_POOL_HLIM_BASE	256
+
+/**
+ * @lh		- list head of chunk pool;
+ * @count	- current number of chunks in @lh;
+ * @h_limit	- hard limit for size of @lh;
+ * @max		- current maximum allowed size of the list, can be 0.
+ */
+typedef struct {
+	struct list_head	lh;
+	unsigned int		count;
+	unsigned int		h_limit;
+	unsigned int		max;
+} TfwSkbMemPool;
+
+static DEFINE_PER_CPU(TfwSkbMemPool [PG_LISTS_N], pg_mpool);
+
+static bool
+__pg_pool_grow(TfwSkbMemPool *pool)
+{
+	if (!pool->count) {
+		/* Too few chunks were provisioned. */
+		unsigned int n = max(pool->max, 1U) << 1; /* start from 2 */
+		pool->max = (n > pool->h_limit) ? pool->h_limit : n;
+		return false;
+	}
+	if (pool->max < pool->h_limit)
+		++pool->max;
+	return true;
+}
+
+static bool
+__pg_pool_shrink(TfwSkbMemPool *pool)
+{
+	if (unlikely(pool->count >= pool->max)) {
+		/* Producers are much faster consumers right now. */
+		pool->max >>= 1;
+		while (pool->count > pool->max) {
+			struct list_head *pc = pool->lh.next;
+			list_del(pc);
+			put_page(virt_to_page(pc));
+			--pool->count;
+		}
+		return false;
+	}
+	/*
+	 * Producers and consumers look balanced.
+	 * Slowly reduce provisioning.
+	 */
+	if (pool->max)
+		--pool->max;
+	return true;
+}
+
+void *
+pg_skb_alloc(unsigned int size, gfp_t gfp_mask, int node)
+{
+	/*
+	 * Don't disable softirq if hardirqs are already disabled to avoid
+	 * warning in __local_bh_enable_ip(). Disable user space process
+	 * preemption as well as preemption by softirq (see SOFTIRQ_LOCK_OFFSET
+	 * usage in spin locks for the same motivation).
+	 */
+	bool dolock = !(in_irq() || irqs_disabled());
+#define PREEMPT_CTX_DISABLE()						\
+do {									\
+	if (dolock)							\
+		local_bh_disable();					\
+	preempt_disable();						\
+} while (0)
+
+#define PREEMPT_CTX_ENABLE()						\
+do {									\
+	preempt_enable();						\
+	if (dolock)							\
+		local_bh_enable();					\
+} while (0)
+
+	char *ptr;
+	struct page *pg;
+	TfwSkbMemPool *pools;
+	unsigned int c, cn, o, l, po;
+
+	cn = PG_CHUNK_NUM(size);
+	po = get_order(PG_ALLOC_SZ(size));
+
+	PREEMPT_CTX_DISABLE();
+
+	pools = this_cpu_ptr(pg_mpool);
+
+	o = (cn == 1) ? 0
+	    : (cn == 2) ? 1
+	      : (cn <= 4) ? 2
+	        : (cn <= 8) ? 3
+		  : (cn <= 16) ? 4 : PG_LISTS_N;
+
+	for (; o < PG_LISTS_N; ++o)
+	{
+		struct list_head *pc;
+		if (!__pg_pool_grow(&pools[o]))
+			continue;
+
+		pc = pools[o].lh.next;
+		list_del(pc);
+		--pools[o].count;
+		ptr = (char *)pc;
+		pg = virt_to_page(ptr);
+		goto assign_tail_chunks;
+	}
+
+	PREEMPT_CTX_ENABLE();
+
+	/*
+	 * Add compound page metadata, if page order is > 0.
+	 * Don't use __GFP_NOMEMALLOC to allow caller access to reserved pools if
+	 * it requested so.
+	 */
+	gfp_mask |= __GFP_NOWARN | __GFP_NORETRY | (po ? __GFP_COMP : 0);
+	pg = alloc_pages_node(node, gfp_mask, po);
+	if (!pg)
+		return NULL;
+	ptr = (char *)page_address(pg);
+	/*
+	 * Don't try to split compound page. Also don't try to reuse pages
+	 * from reserved memory areas to put and free them quicker.
+	 *
+	 * TODO compound pages can be split as __alloc_page_frag() does it
+	 * using fragment size in page reference counter. Large messages
+	 * (e.g. large HTML pages returned by a backend server) go this way
+	 * and allocate compound pages.
+	 */
+	if (po || page_is_pfmemalloc(pg))
+		return ptr;
+	o = PAGE_SHIFT - PG_CHUNK_BITS;
+
+	PREEMPT_CTX_DISABLE();
+
+	pools = this_cpu_ptr(pg_mpool);
+
+assign_tail_chunks:
+	/* Split and store small tail chunks. */
+	for (c = cn, cn = 1 << o, l = PG_LISTS_N - 1; c < cn; c += (1 << l)) {
+		struct list_head *chunk;
+		while (c + (1 << l) > cn)
+			--l;
+		chunk = (struct list_head *)(ptr + PG_CHUNK_SZ * c);
+		if (__pg_pool_shrink(&pools[l])) {
+			get_page(pg);
+			list_add(chunk, &pools[l].lh);
+			++pools[l].count;
+		}
+	}
+
+	PREEMPT_CTX_ENABLE();
+
+	return ptr;
+#undef PREEMPT_CTX_DISABLE
+#undef PREEMPT_CTX_ENABLE
+}
+EXPORT_SYMBOL(pg_skb_alloc);
 
 /* 	Allocate a new skbuff. We do this ourselves so we can fill in a few
  *	'private' fields and also do memory statistics to find all the
@@ -622,27 +838,47 @@ out:
 struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 			    int flags, int node)
 {
+#ifndef CONFIG_SECURITY_TEMPESTA
 	struct kmem_cache *cache;
+#endif
 	struct sk_buff *skb;
 	bool pfmemalloc;
 	u8 *data;
+#ifdef CONFIG_SECURITY_TEMPESTA
+	size_t skb_sz = (flags & SKB_ALLOC_FCLONE)
+			? SKB_DATA_ALIGN(sizeof(struct sk_buff_fclones))
+			: SKB_DATA_ALIGN(sizeof(struct sk_buff));
+	struct page *pg;
+#endif
 
+#ifndef CONFIG_SECURITY_TEMPESTA
 	cache = (flags & SKB_ALLOC_FCLONE)
 		? skbuff_fclone_cache : skbuff_cache;
+#endif
 
 	if (sk_memalloc_socks() && (flags & SKB_ALLOC_RX))
 		gfp_mask |= __GFP_MEMALLOC;
 
+#ifdef CONFIG_SECURITY_TEMPESTA
+	kmalloc_reserve_size(&size, gfp_mask, node, &pfmemalloc);
+	if (!(skb = pg_skb_alloc(skb_sz + size, gfp_mask, node)))
+		return NULL;
+	data = (u8 *)skb + skb_sz;
+	pg = virt_to_head_page(data);
+	get_page(pg);
+#else
 	/* Get the HEAD */
 	if ((flags & (SKB_ALLOC_FCLONE | SKB_ALLOC_NAPI)) == SKB_ALLOC_NAPI &&
 	    likely(node == NUMA_NO_NODE || node == numa_mem_id()))
 		skb = napi_skb_cache_get();
 	else
 		skb = kmem_cache_alloc_node(cache, gfp_mask & ~GFP_DMA, node);
+#endif
 	if (unlikely(!skb))
 		return NULL;
 	prefetchw(skb);
 
+#ifndef CONFIG_SECURITY_TEMPESTA
 	/* We do our best to align skb_shared_info on a separate cache
 	 * line. It usually works because kmalloc(X > SMP_CACHE_BYTES) gives
 	 * aligned memory blocks, unless SLUB/SLAB debug is enabled.
@@ -651,6 +887,7 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 	data = kmalloc_reserve(&size, gfp_mask, node, &pfmemalloc);
 	if (unlikely(!data))
 		goto nodata;
+#endif
 	/* kmalloc_size_roundup() might give us more room than requested.
 	 * Put skb_shared_info exactly at the end of allocated zone,
 	 * to allow max possible filling before reallocation.
@@ -665,6 +902,10 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 	memset(skb, 0, offsetof(struct sk_buff, tail));
 	__build_skb_around(skb, data, size);
 	skb->pfmemalloc = pfmemalloc;
+#ifdef CONFIG_SECURITY_TEMPESTA
+	skb->head_frag = 1;
+	skb->skb_page = 1;
+#endif
 
 	if (flags & SKB_ALLOC_FCLONE) {
 		struct sk_buff_fclones *fclones;
@@ -673,12 +914,19 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 
 		skb->fclone = SKB_FCLONE_ORIG;
 		refcount_set(&fclones->fclone_ref, 1);
+
+#ifdef CONFIG_SECURITY_TEMPESTA
+		fclones->skb2.skb_page = 1;
+		fclones->skb2.head_frag = 1;
+#endif
 	}
 
 	return skb;
 
+#ifndef CONFIG_SECURITY_TEMPESTA
 nodata:
 	kmem_cache_free(cache, skb);
+#endif
 	return NULL;
 }
 EXPORT_SYMBOL(__alloc_skb);
@@ -1048,7 +1296,12 @@ static void kfree_skbmem(struct sk_buff *skb)
 
 	switch (skb->fclone) {
 	case SKB_FCLONE_UNAVAILABLE:
-		kmem_cache_free(skbuff_cache, skb);
+#ifdef CONFIG_SECURITY_TEMPESTA
+		if (skb->skb_page)
+			put_page(virt_to_page(skb));
+		else
+#endif
+			kmem_cache_free(skbuff_cache, skb);
 		return;
 
 	case SKB_FCLONE_ORIG:
@@ -1069,7 +1322,12 @@ static void kfree_skbmem(struct sk_buff *skb)
 	if (!refcount_dec_and_test(&fclones->fclone_ref))
 		return;
 fastpath:
+#ifdef CONFIG_SECURITY_TEMPESTA
+	BUG_ON(!skb->skb_page);
+	put_page(virt_to_page(skb));
+#else
 	kmem_cache_free(skbuff_fclone_cache, fclones);
+#endif
 }
 
 void skb_release_head_state(struct sk_buff *skb)
@@ -1156,6 +1414,13 @@ static void kfree_skb_add_bulk(struct sk_buff *skb,
 			       struct skb_free_array *sa,
 			       enum skb_drop_reason reason)
 {
+#ifdef CONFIG_SECURITY_TEMPESTA
+	if (likely(skb->skb_page)) {
+		__kfree_skb(skb);
+		return;
+	}
+#endif
+
 	/* if SKB is a clone, don't handle this case */
 	if (unlikely(skb->fclone != SKB_FCLONE_UNAVAILABLE)) {
 		__kfree_skb(skb);
@@ -1345,6 +1610,17 @@ static void napi_skb_cache_put(struct sk_buff *skb)
 	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
 	u32 i;
 
+	/*
+	 * Tempesta uses its own fast page allocator for socket buffers,
+	 * so no need to use napi_alloc_cache for paged skbs.
+	 */
+#ifdef CONFIG_SECURITY_TEMPESTA
+	if (skb->skb_page) {
+		put_page(virt_to_page(skb));
+		return;
+	}
+#endif
+
 	if (!kasan_mempool_poison_object(skb))
 		return;
 
@@ -1376,7 +1652,12 @@ void napi_skb_free_stolen_head(struct sk_buff *skb)
 		skb_orphan(skb);
 		skb->slow_gro = 0;
 	}
-	napi_skb_cache_put(skb);
+#ifdef CONFIG_SECURITY_TEMPESTA
+	if (skb->skb_page)
+		put_page(virt_to_page(skb));
+	else
+#endif
+		napi_skb_cache_put(skb);
 }
 
 void napi_consume_skb(struct sk_buff *skb, int budget)
@@ -1470,6 +1751,9 @@ static struct sk_buff *__skb_clone(struct sk_buff *n, struct sk_buff *skb)
 	n->sk = NULL;
 	__copy_skb_header(n, skb);
 
+#ifdef CONFIG_SECURITY_TEMPESTA
+	C(tail_lock);
+#endif
 	C(len);
 	C(data_len);
 	C(mac_len);
@@ -1946,6 +2230,10 @@ struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t gfp_mask)
 	    refcount_read(&fclones->fclone_ref) == 1) {
 		n = &fclones->skb2;
 		refcount_set(&fclones->fclone_ref, 2);
+#ifdef CONFIG_SECURITY_TEMPESTA
+		BUG_ON(!skb->skb_page);
+		BUG_ON(!n->skb_page);
+#endif
 		n->fclone = SKB_FCLONE_CLONE;
 	} else {
 		if (skb_pfmemalloc(skb))
@@ -1956,6 +2244,9 @@ struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t gfp_mask)
 			return NULL;
 
 		n->fclone = SKB_FCLONE_UNAVAILABLE;
+#ifdef CONFIG_SECURITY_TEMPESTA
+		n->skb_page = 0;
+#endif
 	}
 
 	return __skb_clone(n, skb);
@@ -2133,10 +2424,18 @@ int pskb_expand_head(struct sk_buff *skb, int nhead, int ntail,
 	if (skb_pfmemalloc(skb))
 		gfp_mask |= __GFP_MEMALLOC;
 
+#ifdef CONFIG_SECURITY_TEMPESTA
+	kmalloc_reserve_size(&size, gfp_mask, NUMA_NO_NODE, NULL);
+	data = pg_skb_alloc(size, gfp_mask, NUMA_NO_NODE);
+	if (!data)
+		goto nodata;
+	size = SKB_WITH_OVERHEAD(PG_ALLOC_SZ(size));
+#else
 	data = kmalloc_reserve(&size, gfp_mask, NUMA_NO_NODE, NULL);
 	if (!data)
 		goto nodata;
 	size = SKB_WITH_OVERHEAD(size);
+#endif
 
 	/* Copy only real data... and, alas, header. This should be
 	 * optimized for the cases when header is void.
@@ -2170,7 +2469,12 @@ int pskb_expand_head(struct sk_buff *skb, int nhead, int ntail,
 	off = (data + nhead) - skb->head;
 
 	skb->head     = data;
+#ifdef CONFIG_SECURITY_TEMPESTA
+	skb->head_frag = 1;
+	skb->tail_lock = 0;
+#else
 	skb->head_frag = 0;
+#endif
 	skb->data    += off;
 
 	skb_set_end_offset(skb, size);
@@ -2196,7 +2500,11 @@ int pskb_expand_head(struct sk_buff *skb, int nhead, int ntail,
 	return 0;
 
 nofrags:
+#ifdef CONFIG_SECURITY_TEMPESTA
+	put_page(virt_to_page(data));
+#else
 	skb_kfree_head(data, size);
+#endif
 nodata:
 	return -ENOMEM;
 }
@@ -2404,7 +2712,11 @@ int __skb_pad(struct sk_buff *skb, int pad, bool free_on_error)
 		return 0;
 	}
 
+#ifdef CONFIG_SECURITY_TEMPESTA
+	ntail = skb->data_len + pad - skb_tailroom_locked(skb);
+#else
 	ntail = skb->data_len + pad - (skb->end - skb->tail);
+#endif
 	if (likely(skb_cloned(skb) || ntail > 0)) {
 		err = pskb_expand_head(skb, 0, ntail, GFP_ATOMIC);
 		if (unlikely(err))
@@ -2687,7 +2999,13 @@ void *__pskb_pull_tail(struct sk_buff *skb, int delta)
 	 * plus 128 bytes for future expansions. If we have enough
 	 * room at tail, reallocate without expansion only if skb is cloned.
 	 */
-	int i, k, eat = (skb->tail + delta) - skb->end;
+	int i, k, eat;
+
+#ifdef CONFIG_SECURITY_TEMPESTA
+	eat = delta - skb_tailroom_locked(skb);
+#else
+	eat = (skb->tail + delta) - skb->end;
+#endif
 
 	if (eat > 0 || skb_cloned(skb)) {
 		if (pskb_expand_head(skb, 0, eat > 0 ? eat + 128 : 0,
@@ -4889,6 +5207,25 @@ static void skb_extensions_init(void) {}
 
 void __init skb_init(void)
 {
+#ifdef CONFIG_SECURITY_TEMPESTA
+	int cpu, l;
+	for_each_online_cpu(cpu)
+		for (l = 0; l < PG_LISTS_N; ++l) {
+			TfwSkbMemPool *pool = per_cpu_ptr(&pg_mpool[l], cpu);
+			INIT_LIST_HEAD(&pool->lh);
+			/*
+			 * Large chunks are also can be used to get smaller
+			 * chunks, so we cache them more aggressively.
+			 */
+			pool->h_limit = PG_POOL_HLIM_BASE << l;
+		}
+#else
+	skbuff_fclone_cache = kmem_cache_create("skbuff_fclone_cache",
+						sizeof(struct sk_buff_fclones),
+						0,
+						SLAB_HWCACHE_ALIGN|SLAB_PANIC,
+						NULL);
+#endif
 	skbuff_cache = kmem_cache_create_usercopy("skbuff_head_cache",
 					      sizeof(struct sk_buff),
 					      0,
@@ -4897,11 +5234,6 @@ void __init skb_init(void)
 					      offsetof(struct sk_buff, cb),
 					      sizeof_field(struct sk_buff, cb),
 					      NULL);
-	skbuff_fclone_cache = kmem_cache_create("skbuff_fclone_cache",
-						sizeof(struct sk_buff_fclones),
-						0,
-						SLAB_HWCACHE_ALIGN|SLAB_PANIC,
-						NULL);
 	/* usercopy should only access first SKB_SMALL_HEAD_HEADROOM bytes.
 	 * struct skb_shared_info is located at the end of skb->head,
 	 * and should not be copied to/from user.
@@ -5779,7 +6111,15 @@ void kfree_skb_partial(struct sk_buff *skb, bool head_stolen)
 {
 	if (head_stolen) {
 		skb_release_head_state(skb);
+#ifdef CONFIG_SECURITY_TEMPESTA
+		/*
+		 * fclones are possible here with Tempesta due to using
+		 * pskb_copy_for_clone() in ss_send().
+		 */
+		kfree_skbmem(skb);
+#else
 		kmem_cache_free(skbuff_cache, skb);
+#endif
 	} else {
 		__kfree_skb(skb);
 	}
@@ -6442,10 +6782,18 @@ static int pskb_carve_inside_header(struct sk_buff *skb, const u32 off,
 	if (skb_pfmemalloc(skb))
 		gfp_mask |= __GFP_MEMALLOC;
 
+#ifdef CONFIG_SECURITY_TEMPESTA
+	kmalloc_reserve_size(&size, gfp_mask, NUMA_NO_NODE, NULL);
+	data = pg_skb_alloc(size, gfp_mask, NUMA_NO_NODE);
+	if (!data)
+		return -ENOMEM;
+	size = SKB_WITH_OVERHEAD(PG_ALLOC_SZ(size));
+#else
 	data = kmalloc_reserve(&size, gfp_mask, NUMA_NO_NODE, NULL);
 	if (!data)
 		return -ENOMEM;
 	size = SKB_WITH_OVERHEAD(size);
+#endif
 
 	/* Copy real data, and all frags */
 	skb_copy_from_linear_data_offset(skb, off, data, new_hlen);
@@ -6458,7 +6806,11 @@ static int pskb_carve_inside_header(struct sk_buff *skb, const u32 off,
 	if (skb_cloned(skb)) {
 		/* drop the old head gracefully */
 		if (skb_orphan_frags(skb, gfp_mask)) {
+#ifdef CONFIG_SECURITY_TEMPESTA
+			skb_free_frag(data);
+#else
 			skb_kfree_head(data, size);
+#endif
 			return -ENOMEM;
 		}
 		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++)
@@ -6475,7 +6827,11 @@ static int pskb_carve_inside_header(struct sk_buff *skb, const u32 off,
 
 	skb->head = data;
 	skb->data = data;
+#ifdef CONFIG_SECURITY_TEMPESTA
+	skb->head_frag = 1;
+#else
 	skb->head_frag = 0;
+#endif
 	skb_set_end_offset(skb, size);
 	skb_set_tail_pointer(skb, skb_headlen(skb));
 	skb_headers_offset_update(skb, 0);
@@ -6558,15 +6914,27 @@ static int pskb_carve_inside_nonlinear(struct sk_buff *skb, const u32 off,
 	if (skb_pfmemalloc(skb))
 		gfp_mask |= __GFP_MEMALLOC;
 
+#ifdef CONFIG_SECURITY_TEMPESTA
+	kmalloc_reserve_size(&size, gfp_mask, NUMA_NO_NODE, NULL);
+	data = pg_skb_alloc(size, gfp_mask, NUMA_NO_NODE);
+	if (!data)
+		return -ENOMEM;
+	size = SKB_WITH_OVERHEAD(PG_ALLOC_SZ(size));
+#else
 	data = kmalloc_reserve(&size, gfp_mask, NUMA_NO_NODE, NULL);
 	if (!data)
 		return -ENOMEM;
 	size = SKB_WITH_OVERHEAD(size);
+#endif
 
 	memcpy((struct skb_shared_info *)(data + size),
 	       skb_shinfo(skb), offsetof(struct skb_shared_info, frags[0]));
 	if (skb_orphan_frags(skb, gfp_mask)) {
+#ifdef CONFIG_SECURITY_TEMPESTA
+		skb_free_frag(data);
+#else
 		skb_kfree_head(data, size);
+#endif
 		return -ENOMEM;
 	}
 	shinfo = (struct skb_shared_info *)(data + size);
@@ -6602,13 +6970,21 @@ static int pskb_carve_inside_nonlinear(struct sk_buff *skb, const u32 off,
 		/* skb_frag_unref() is not needed here as shinfo->nr_frags = 0. */
 		if (skb_has_frag_list(skb))
 			kfree_skb_list(skb_shinfo(skb)->frag_list);
+#ifdef CONFIG_SECURITY_TEMPESTA
+		skb_free_frag(data);
+#else
 		skb_kfree_head(data, size);
+#endif
 		return -ENOMEM;
 	}
 	skb_release_data(skb, SKB_CONSUMED, false);
 
 	skb->head = data;
+#ifdef CONFIG_SECURITY_TEMPESTA
+	skb->head_frag = 1;
+#else
 	skb->head_frag = 0;
+#endif
 	skb->data = data;
 	skb_set_end_offset(skb, size);
 	skb_reset_tail_pointer(skb);
